@@ -1,0 +1,11 @@
+{
+  "DEBUG_MODE": false,
+  "groq_api_key": "",
+  "groq_model": "llama-3.1-8b-instant",
+  "hotkeys": {
+    "format_repair": "ctrl+shift+c",
+    "translate": "ctrl+shift+t"
+  },
+  "translate_target_language": "Chinese",
+  "api_timeout_seconds": 3
+}
