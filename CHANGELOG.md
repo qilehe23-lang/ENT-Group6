@@ -1,6 +1,357 @@
 # Deadline Survivor — Changelog
 
-## v1.2 — "Semantic Augmentor" (in progress)
+## v1.3 — "Multi-Engine" (in progress)
+
+### 目标
+把锁死 Groq 的 LLM 层升级为可插拔的 provider 系统。
+用户可以在 Groq / OpenAI / DeepSeek / Kimi / GLM / Qwen / SiliconFlow / Custom
+之间任意切换，每个 provider 单独存 api_key / model / base_url / timeout。
+
+### 架构
+
+```
+ai/
+├── providers/
+│   ├── base.py          ← LLMProvider ABC + ChatResult / TestConnectionResult
+│   ├── errors.py        ← AuthError / RateLimitError / ServerError /
+│   │                      ConnectionError / ProviderTimeoutError
+│   ├── groq.py          ← GroqProvider (用 groq SDK)
+│   ├── openai_compat.py ← OpenAICompatProvider (用 httpx 直连
+│   │                      /v1/chat/completions —— 一套代码覆盖
+│   │                      OpenAI / DeepSeek / Kimi / GLM / Qwen /
+│   │                      SiliconFlow / Custom)
+│   └── registry.py      ← PROVIDERS spec list + build_provider() factory
+├── llm_client.py        ← 新单例（取代 groq_client），run_task /
+│                          chat_raw / effective_config / test_connection
+└── groq_client.py       ← 兼容 shim，re-export `groq_client = llm_client`
+```
+
+### 步骤
+
+1. **Provider 抽象层**：`ai/providers/` 全包，含 base / errors / registry
+   / groq / openai_compat。所有 provider 把原生异常归一化成
+   `ProviderError` 子类，其中 `ProviderTimeoutError` 同时继承
+   `TimeoutError` 保证 `core/worker.py` 的 fallback 链不破。
+2. **OpenAICompatProvider**：用 `httpx`（Groq SDK 已带的依赖，零新增）
+   直连 `/v1/chat/completions`，一套代码服务 7 个 provider + Custom
+   base_url 自定义。
+3. **llm_client 单例**：`ai/llm_client.py` 取代 `ai/groq_client.py`，
+   `from ai.llm_client import llm_client` 是新规范入口。
+   旧 `from ai.groq_client import groq_client` 仍然可用 —— 后者改成 shim
+   re-export。
+4. **schema 迁移**：`core/tasks.migrate_settings()` 自动把
+   v1.2 顶层 `groq_api_key` / `groq_model` / `api_timeout_seconds`
+   挪到 `providers.groq.{api_key, model, timeout_s}`，并补全 8 个 provider
+   的空 stub。**保留旧字段不删**（v1.2 回滚兼容）。
+5. **错误分类**：401/403 → AuthError；429 → RateLimitError；
+   5xx → ServerError；DNS/TLS → ConnectionError；timeout
+   → ProviderTimeoutError。`utils.user_facing_message()` 给出
+   toast 友好文案。
+6. **Test Connection**：每个 provider 自带 `test_connection(model, timeout)`
+   返回 `(ok, rtt_ms, error_kind, detail)`，给 v1.3 Engine 页的 TEST 按钮
+   用（UI 还在等 Design）。
+7. **chat_raw 公共入口**：LIVE TEST sandbox 之前用 `_call_api` 私有方法，
+   现在改走公共 `llm_client.chat_raw()`。
+8. **测试覆盖**：75 → 102 全过。新增 `test_providers.py`
+   （registry / 错误分类 / OpenAICompat HTTP / GroqProvider mock SDK）；
+   `test_tasks.py` 加了 6 条 TestProvidersMigration 用例。
+   `test_groq_client.py` 全部重写为 LLMClient 行为测试，名字保留方便
+   git history 跟踪。
+
+### 显式不做的事（留给 v1.4+）
+
+- ❌ Anthropic / Claude（用户决策：先做便宜的国产模型）
+- ❌ Ollama 本地模型（v1.4+）
+- ❌ keyring / 加密存储 API key（v1.5+）
+- ❌ 任务级 model override（v1.4+）
+- ❌ Settings 导入导出（v1.4+）
+- ❌ 命令面板 provider 切换（v1.4+）
+- ❌ 配额条 tray UI（每家 provider rate-limit headers 不统一，独立迭代）
+- ❌ Tasks 页 per-task 历史 audit 列（cost data 已经写盘，UI 暂缓）
+- ❌ Toast 大额成本阈值提醒（容易过度打扰，谨慎开 v1.4+）
+
+### 已落地（先前列在"不做"里现在做了的）
+
+- ✅ Token / 成本估算（v1.3 后期，见下方进度日志 2026-05-12）
+- ✅ Tray 状态条 v3 pulse 变体（v1.3 后期）
+- ✅ `supports_vision` 元数据（v1.4 视觉模式 forward-prep）
+
+### 进度日志
+
+- 2026-05-10 Step 1-3 完成（不依赖 UI 部分）：providers 抽象 + OpenAI 兼容
+  provider + llm_client 单例 + migrate_settings v1.3 升级 + 102 单测全过。
+  UI 改造（Engine 页 provider 选择器 + TEST 按钮）等待 Design 给设计稿。
+- 2026-05-10 Step 4-5 完成（Engine 页 UI 落地）：按 v3 设计稿实现，新建
+  `ui/engine_page.py`（~870 LOC），改造 `_page_engine`：
+  - **Provider grid 4×2** — 8 个 168×124 frosted-glass tile，4 状态
+    （idle / hover / configured / selected）。Tile 全自绘 paintEvent
+    避免 v1.2 ghost shadow 那条坑路径。每 provider 一个原创 SVG monogram
+    （非厂商 logo）。
+  - **ConfigCard** — API Key（password + SHOW/HIDE + VALID 指示）+
+    Base URL 覆盖 + Model 下拉（可编辑，从 registry 拉
+    available_models）+ Timeout 秒数。卡片有 lime drop-shadow glow。
+  - **TestPanel "诊断剧场"** — 4 状态：idle / probing / success /
+    error。probing 时 32 条动画 bar + lime sweep 横扫，RTT 实时 +0.1s
+    ticking；success 显示大号 lime RTT + drop-shadow glow + model 卡；
+    error 4 类（401/429/NET/T-O）按 magenta/amber 双色调分离。
+  - **`_TestConnectionWorker(QThread)`** — 包 `llm_client.test_connection`，
+    避免主线程冻结。Cancel 按钮可中断。
+  - **OFFLINE MOCK MODE 复活**：v3 设计没画但保留为 footer 的低视觉
+    复选框（power user 需要无 key 离线测）。
+  - 调整：API key hint 改成 "Stored locally in settings.json · never
+    sent in logs"（不假装有 keyring）；AUTOSAVE chip 改 "MANUAL · ⌘S
+    TO APPLY"；5 阶段 stage chips 简化为单条 stage 文案；speed t/s
+    指示去掉（无数据来源）。
+  - 砍掉的范围：Hero 标题栏 / 左 rail 重做 / Tray 状态条三变体
+    （都不在 Engine 页范畴；后续单独迭代）。
+  - 102 单测继续全过；dialog 真实 event loop 渲染验证通过。
+- 2026-05-11 真机测试反馈批量修复：
+  - **About 页两处 v1.2 漏改 → v1.3**（`settings_dialog.py:560` 大字
+    版本号 + `:614` "RELEASED 2026 · v1.2"）。pitch 文案
+    "Eight tasks behind one keystroke" → "Eight engines, one keystroke"。
+    `hero_toast.py` 两处默认参数 `version="v1.2"` 同步改 v1.3，build_meta
+    改 "build 311 · multi-engine"。`main.py:324` 启动日志同步。
+  - **First-run dialog v1.3 改造**：之前还在写 v1.2 flat schema
+    （顶层 `groq_api_key`），改为调 `migrate_settings()` 写完整 v1.3
+    schema（`active_provider="groq"` + `providers.groq.api_key=<key>`
+    + 8 个 provider 空 stub）。同时保留 legacy `groq_api_key` 顶层
+    （v1.2 回滚兼容）。Welcome blurb 也改为 provider-agnostic：
+    "ships with eight engines... Groq is the fastest free option...
+    switch any time in Settings → Engine"。
+  - **Engine 页底部丑横向滚动条修复**：`setHorizontalScrollBarPolicy
+    (Qt.ScrollBarAlwaysOff)` 完全禁用横向；纵向 scrollbar 重写 QSS
+    （margin 收紧、handle 圆角 4px、add-line/sub-line/add-page/sub-page
+    全置透明）。
+  - **Model 下拉箭头方块 dot bug**：Qt 默认 `QComboBox::down-arrow` 用
+    per-style pixmap，dark 主题下不响应 QSS 颜色覆盖，渲染成黑方块。
+    新建 `_ChevronComboBox` 子类，paintEvent 在右侧自绘 8×4px 双线
+    chevron；QSS 把原生箭头 `image: none; width:0; height:0` 隐藏，
+    padding 右侧留 28px 给 chevron。同步 popup item min-height + padding。
+- 2026-05-11 Provider grid 右侧截断 bug 修复：
+  - **症状**：v1.3 Engine 页底部横向滚动条禁用后，4 个 168px tile
+    + 3 gap (10) + body padding (26+26) = 754px > engine page 实际可用
+    687px → 多出 67px 被截。
+  - **修法**：tile `setFixedSize` 改 `setFixedHeight(124) +
+    setMinimumWidth(140) + QSizePolicy.Expanding`；grid 4 列
+    `setColumnStretch(col, 1)` 平分宽度；body padding 26 → 18。
+    实测每 tile 自适应到 153px，grid 643px ≤ 651px 可用，余 8px 安全边。
+- 2026-05-11 真机另一台电脑发现的"重复 BUILTIN 标签" bug：
+  - **症状**：v1.2 打包 exe 在别人机器上点 Format Repair 出现两个
+    BUILTIN 标签（dev 机看不到）。
+  - **根因**：`QListWidget.setItemWidget(item, new_widget)` 跨 Qt /
+    Windows / DPI 组合下**不可靠地删除旧 widget** —— 旧 _TaskRow
+    保留在 widget 树里，dev 机上新 widget 完全覆盖看不出来；用户机
+    DPI/字体回退使旧 widget BUILTIN 标签从新 widget 边缘漏出。
+  - **触发链**：每次 `_refresh_row` 都泄漏一个旧 _TaskRow。
+    `_on_select(idx)` → `editor.load_task()` → `finally` 块的
+    `_on_prompt_changed()` → `_maybe_emit()` → `_on_editor_changed`
+    → `_refresh_row` → `setItemWidget` 留下孤儿。
+  - **实测**：5 次 refresh 后页面 9 个 BUILTIN（应该 2 个）。
+  - **修法**：`tasks_page._refresh_row` 显式 `removeItemWidget(item)`
+    → `old.setParent(None)` → `old.deleteLater()` → 然后 setItemWidget
+    新 widget。`reload()` 同样防御式回收（clear() 同样不可靠）。
+  - 修复后 5 次 refresh + 10 次切换 + 2 次 reload → 始终 2 个 BUILTIN。
+- 2026-05-11 v1.4 forward-prep · supports_vision 元数据：
+  - `ProviderSpec` 加 `supports_vision: bool = False`。OpenAI / GLM /
+    Qwen / SiliconFlow / Custom 标 True（vision-capable 模型族）；
+    Groq / DeepSeek / Kimi 标 False（当前主线模型只接受文本）。
+  - **当前没有任何代码读这个字段** —— 纯元数据预留。v1.4 视觉模式
+    上线时 Engine 页 model 下拉过滤 / 📷 角标 / 剪贴板图片捕获判断
+    都从这里读。
+- 2026-05-11 Tray pulse 状态条（v3 设计 TrayPulse 变体）：
+  - 新建 `_PulseStrip`（320×38）+ `_SparkBars`（15 条 amplitude-alpha
+    bar）+ `_PipDot`（halo 圆点，颜色随 key 状态切换）三个 widget。
+  - 布局：`[●] Provider [▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮] 87ms`，挂在 tray menu **最顶部**
+    （via `QWidgetAction`），`_TelemetryHeader` 保留在下方做累计统计。
+  - `menu.aboutToShow` 时同时刷 pulse + telemetry header。
+  - 防御式：上游任何异常都不让 tray crash（tray 是用户交互入口，
+    硬死会让用户以为整个 app 挂了）。
+- 2026-05-12 Token / 成本估算（"必做"两层 — TestPanel 校准 + Tray $today）：
+  - 新建 `ai/pricing.py`（~190 LOC）— 8 provider × N model 单价表
+    （USD/M tokens），含 CNY → USD `_cny()` 单点换算（汇率 7.30）。
+    `estimate_cost()` 用"最长子串匹配"找定价（写一次 `"llama-3.1-8b"`
+    catch 所有 `-instant`/`-instruct` 变体）。
+    Format helpers：`format_cost_short`（tray 用 `$0.08`/`<$0.01`）、
+    `format_cost_per_probe`（test panel 用 `≈ $0.000016`）、
+    `project_cost_per_1k`（projection `≈ $0.016`）。
+  - 数据流改造：provider chat 已有 `prompt_tokens` / `completion_tokens`
+    → llm_client `_call_provider` 计算成本 → side-channel 写入
+    `llm_client.last_usage`（新 `LastUsage` dataclass，不动 run_task
+    返回签名以免 10+ 处 caller / shim 全炸）→ main.py
+    `_on_worker_success` 读出来喂给 `telemetry.record_op()`（kwarg
+    扩展）→ `telemetry.snapshot()` 暴露 `today_cost` / `total_cost` /
+    `total_tokens`，跨日 `today_cost` 跟 `today_ops` 一起重置。
+  - **TestPanel success 右栏改造**：从一句话变成 3 行 mono：
+    `{tps} t/s · {tot} tok` / `≈ ${x} / probe` / `≈ ${y} / 1k repairs`。
+    未知 model（custom endpoint）→ `—` + "(model not in pricing table)"
+    解释，**不显示 $0** 避免误读为"免费"。`is_estimate=True` + 价格 0
+    （如 GLM-4-flash）→ "≈ free"，与未知区分开。
+  - **Tray `_TelemetryHeader` 第 3 列**：`SAVED 18420c` (demo day vanity
+    指标) → `$ TODAY $0.08`（更可操作）。
+  - **TestConnectionResult 扩展**：加 `prompt_tokens` / `completion_tokens`
+    字段；GroqProvider + OpenAICompatProvider 在 `test_connection`
+    里把这俩 thread 进去（test 也调底层 chat，已经有数据）。
+  - **未知 model 不计入 today_cost**：避免 custom endpoint 的 $0 拉低
+    真实账单可信度。
+  - 新增 `tests/test_pricing.py` 17 测：lookup 长前缀优先 / unknown
+    路径 / 边界（负数/0）/ format helpers / 表 schema 完整性。
+    总测试 102 → 119 全过。
+- 2026-05-12 决策：配额条 tray UI 不做。每家 provider 配额信号不统一
+  （Groq RPM/TPM、OpenAI 付费无配额、GLM-4-flash 才有日配额、SiliconFlow
+  按模型分），需要 per-provider 解析 rate-limit headers 单独迭代，
+  超出 v1.3 范围。
+
+- 2026-05-12 流式输出（v1.3 最后一项）：
+  - **新接口** `LLMProvider.chat_stream(..., on_chunk: StreamCallback) ->
+    ChatResult`。`StreamCallback` = `Callable[[str], bool]`：返回 True
+    继续 / False 取消（provider 必须遵守）。基类有默认实现 = 调
+    `chat()` 一次性 emit 整段 —— 任何 provider 不实现真流式也满足契约。
+  - **GroqProvider** `chat_stream=True` + `stream_options={"include_usage":
+    True}`，遍历 chunks，每个 delta `content` 推到 on_chunk。最终 chunk
+    带 usage 信息，无缝走现有 cost telemetry 管线。on_chunk 返回 False
+    时显式 `stream.close()` 终止上游生成。
+  - **OpenAICompatProvider** raw httpx SSE 解析：`client.stream("POST",
+    ...)` + `iter_lines()`，跳过 `:`-comment 行 / 非 `data:` 字段；
+    `data: [DONE]` 终止；usage 在最后 chunk 里 piggy-back（设置
+    `stream_options.include_usage`）。401/429/5xx 在读 body 之前即抛
+    typed error，不浪费连接。Cancel 通过 break + with-block 自动关连接
+    通知上游停止。
+  - **`llm_client.run_task_streaming(task, text, on_chunk)`**：与
+    `run_task` 平行的入口。Demo override 命中和 mock 模式都兜底 emit
+    一次完整结果（保证 UI 行为一致）。设置开关
+    `streaming_enabled: bool` （默认 False，experimental）。
+  - **`ClipboardWorker` 加 `streaming` flag 和 `chunk` 信号**：流式模式
+    下 `processor_fn(text, on_chunk)`，on_chunk 内部 `self.chunk.emit
+    (fragment)` —— Qt 自动 queued connection 跨线程到主线程。
+    `request_cancel()` 主线程 API：set flag → 下一个 chunk 回 False
+    → provider 关流 → worker 走"用户取消"降级路径（粘贴原文 + 发
+    error 信号 "Cancelled by user"）。**不会残留半截 LLM 输出
+    在剪贴板**（粘贴原文是 worker 的硬不变量）。
+  - **Toast 流式 lifecycle**：`Toast.update_body(text)` 公共方法
+    （tail-truncate 240 char，PlainText 防 `<` 被当 HTML），保留
+    `_msg_label` 引用以便后续更新。`_ToastManager` 加 `_streaming_toast`
+    单一活跃流追踪 + `start_streaming(title, chip)` /
+    `update_streaming(text)` / `end_streaming()` 三件套。`end_streaming`
+    在 `_on_worker_finished` 兜底（任何路径都关）+ 各完成 slot 单独关。
+  - **main.py `_dispatch` 路由**：dispatch 时 snapshot
+    `llm_client.streaming_enabled` 决定 streaming 路径，避免中途 toggle
+    设置导致半流。`_pending["stream_buf"]` 累积全文，`_on_worker_chunk`
+    每次拼接后传给 `update_streaming(buf)` —— toast 拿全文自己
+    tail-truncate（不在主线程做字符串切片）。
+  - **Engine 页 footer 加 `STREAM OUTPUT` 复选框**：对齐 OFFLINE MOCK
+    MODE 视觉，tooltip 解释 "Show tokens as the model generates them
+    (live preview toast). Experimental — falls back to one-shot mode
+    for demo/mock paths."。读写 `settings["streaming_enabled"]`。
+  - **测试**：新增 `tests/test_streaming.py` 9 测：
+    - 默认 fallback emit 一次完整 chunk
+    - OpenAICompat SSE 顺序保留 + usage 解析
+    - 畸形 SSE 行跳过不致死
+    - on_chunk 返 False 立即停（"AB" 不会变成 "ABCD"）
+    - 401 在 stream 前即抛 AuthError
+    - run_task_streaming 路由：mock 模式发一次 / 真 provider 走 chat_stream
+    - streaming_enabled 默认 False / 读 settings
+    总测试 119 → 128 全过。
+  - **决策回顾**：
+    - 非取消式即时停 vs 等待自然完成 → 用了"on_chunk 返 False + 显式
+      close"。理由：成本最小（不付未生成的 token）+ 用户感知响应
+      最快（toast 立刻消失）。
+    - 流中粘贴 vs 等流完粘贴 → 等完成。理由：剪贴板 + Ctrl+V 是单次
+      事件，无法增量送达另一个应用；半截输出粘出去会破坏用户文档。
+    - 处理 toast 在哪（旁边 toast / drawer / 替换主 toast）→ 替换。
+      理由：我们之前根本没有 processing toast 在主流程，streaming 是
+      第一个用例 —— 不要为它新建概念。
+
+- 2026-05-12 流式输出 v4 UI 升级（design v4 handoff · "phrase cycler"）：
+  - **架构调整 — toast 接管 buffer**：v1.3 初版的"主线程拼全文 → toast
+    tail-truncate"模型废弃。新协议：`ClipboardWorker.chunk` 信号每次
+    携带 raw fragment → `main.py._on_worker_chunk` 直接调
+    `toast_manager().feed_chunk(fragment)` → Toast 内部维护
+    `_stream_buf` 并跑 commit 规则。**main.py 不再拼字符串**
+    （`_pending["stream_buf"]` 字段移除）。
+  - **commit 规则下沉到独立模块** `ui/phrase_commit.py`（~65 LOC，
+    Qt-free）：纯函数 `try_commit_phrase(buf) -> (phrase|None, new_buf)`：
+    - R1 — Latin 句末标点 `[.,;:!?—]` + 空格/EOF → 提交至该标点
+    - R2 — 缓冲区 ≥ 6 个完整单词 → 切到最后一个空格
+    - R3 — 缓冲区无任何空白且 ≥ 24 字符 → 优先切到最后一个 CJK 标点
+      `[，。！？；]`，否则切到 24 字符位
+    放在独立模块两个好处：(1) 单测不需要 Qt；(2) toast widget 干净
+    re-export，避免 widget 文件涨到 1500+ LOC 还要写正则。
+  - **`_PhraseStack` widget**（设计稿 § 03 visual spec）：固定高度 40px，
+    QStackedWidget 风格的"已提交 phrase"垂直堆叠，每次 commit 上一条
+    上浮淡出，新一条从下方推入。最多保留 N 条历史（旧的 deleteLater）。
+  - **`_GhostLine` widget**：低饱和 INK2 mono，display `_stream_buf`
+    实时尾部，作为"还没被 R1/R2/R3 切下来的草稿"的视觉指示，让用户
+    感知到"模型还在写"。
+  - **telemetry 行**（toast 顶部右侧）：3 个 mono stat label —
+    `{phrases} phrase · {tokens} tok · {rate} t/s`，phrase / token 在
+    每次 feed_chunk 内 setText（O(1)），t/s 由 200ms `_rate_timer`
+    单独刷（避免每 chunk 都做 monotonic 除法）。流终止时 `_rate_timer.stop()`
+    避免 toast dismiss 后还在跑。
+  - **RACE 边界处理**：`Toast.flush_pending(cancelled=False)` 把残余
+    `_stream_buf` 作为最后一个 phrase 一次性 commit；`cancelled=True`
+    丢弃 buffer（timeout / error / 用户取消 — 半截输出不能伪装成"完整
+    一句话"留在 phrase stack 里）。`_on_worker_success` 调
+    `end_streaming(cancelled=False)`，`_on_worker_timeout` /
+    `_on_worker_error` 调 `cancelled=True`。`_on_worker_finished` 兜底
+    再调一次（任何路径未关 toast 都被这条扫掉，已关的就是 no-op）。
+  - **back-compat**：`toast_manager().update_streaming(text)` 保留为
+    `feed_chunk(text)` 的 shim，避免还没切到新协议的调用方破。
+  - **测试**：`tests/test_streaming.py` 从 9 测扩到 21 测（+12）：
+    - phrase_commit R1/R2/R3 三条规则的 happy path
+    - R1 优先级（句末标点先于词数阈值）
+    - R2 至少 6 词 + 切在最后空格
+    - R3 CJK 标点 / 24 字符兜底 / 缓冲区有空白时不触发
+    - 空 buffer / 只有空白 / 纯单字符等边界
+    - 多个标点连续时只切第一段（懒匹配）
+    总测试 128 → 140 全过。
+  - **决策回顾**：
+    - 为什么把 buffer 从 main.py 挪到 Toast？v4 设计要 ghost line +
+      phrase commit 规则 + 计数器 + 速率，全都基于 buffer 状态。把
+      buffer 放在主线程意味着每次 chunk 都要把状态对象传给 toast，
+      接口面变厚；放在 toast 内则 toast 完全自治 —— main.py 只管
+      "有 fragment 来了就转交"，单一职责。
+    - 为什么 commit 规则放在 `phrase_commit.py` 而不是 `toast.py`？
+      规则是纯逻辑（输入 → 输出），跟渲染无关；放外面让单测不需要
+      PyQt5 stub。把 21 测试里的 commit-rule 测试与 widget 测试解耦。
+    - 为什么 phrase 计数器在 lime 色，token / rate 不是？lime 强调
+      "用户感知到的产出（commit 出来的完整短语）"，token / rate 是
+      技术指标 —— 信息层级用色彩分离，不靠字号。
+
+### v1.3 收尾
+
+所有计划项已完成。剩余未做项全部 explicit 推到 v1.4+（见上方"显式不
+做的事"）。总测试 47 → 75 → 102 → 119 → 128 → 140 全过。
+
+---
+
+## v1.2 — "Semantic Augmentor" (released 2026-05-05)
+
+### v1.2 ship-day fixes (2026-05-05)
+- **Toast paintEvent 崩溃修复**：`ui/toast.py` 的 `drawEllipse` 在 PyQt5 + Python 3.14
+  下不再隐式 float→int，整个 paintEvent 抛 `TypeError`，托盘连同主进程一起死掉。
+  改用 `QRectF(...)` 重载，并把 halo / 左侧 accent edge / 进度条都包进
+  `setClipPath(card_path)` 内，匹配设计稿 `.toast{overflow:hidden}` 行为，
+  消除左上角溢出的硬边阴影斑。
+- **Toast 视觉对齐设计稿**：title 改用自写 `_ElidedLabel` 防止超长被硬截断；
+  meta 行支持 `·` 分隔点；row padding/spacing 改成设计稿的 16/14/30/12 + 14。
+- **Toast caller 修正**：`tray_icon.show_success` 不再把 `feature_name`（含 emoji）
+  既塞进 title 又塞进 chip。emoji 由左侧彩色 glyph tile + lime accent edge 表达
+  状态，title 去 emoji，chip 改成短状态标签（`PASTED` / `FALLBACK`）。
+- **设置页 Tasks 布局**：去掉 body 外 padding 和 list/editor 之间的 14px gap，
+  按设计稿 `.split` 让两栏直接相邻、靠 list-col 的 `border-right` 分隔，
+  解决"右半栏被推太靠右"的视觉断裂。
+- **TARGET LANGUAGE 标签全名**：之前源码就是 `"TARGET LANG"`（不是 UI 截断），
+  补全为 `"TARGET LANGUAGE"`。
+- **Live test 翻译目标语言修复**：之前 `_TestWorker` 直接把原始剪贴板文本作为
+  `user_message` 调 `_call_api`，跳过了 `run_task` 里的
+  `Translate the following text to {lang}:` 包装，LLM 自己挑语言（多半西语）。
+  修：`_TestWorker` 接受 `task` 参数；dialog 的 `_run_test` 检测
+  `task.id == TASK_TRANSLATE` 时手动注入与生产路径一致的 user_message 包装。
+- **Hero Toast 时长**：5.5s → 8s，给用户更充裕时间看 stats 和快捷键提示。
+- **打包**：`build.spec` 补上 `assets/fonts/*.ttf` 数据，frozen 后字体不再回退
+  到系统 stack。`dist/settings.json` 重新写一份空 key 的版本，确认无 `dist/.env`。
+
+## v1.2 — "Semantic Augmentor" (development log)
 
 ### 目标
 把"修复格式 / 翻译"两个固定功能升级为**通用任务系统**。
